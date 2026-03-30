@@ -1,1 +1,185 @@
+#!/usr/bin/env bash
+# tpm-stat.sh — TPM Physical Presence Interface status checker for Linux
+# Translated from TPM-stat.ps1 (Windows/PowerShell)
+#
+# Equivalent Linux references:
+#   https://www.kernel.org/doc/html/latest/security/tpm/tpm_vtpm_proxy.html
+#   https://github.com/tpm2-software/tpm2-tools
+#   /sys/class/tpm/tpm0/ppi/  — kernel PPI sysfs interface
+#
+# Assumes Get-TPM (Windows) => tpm2_getcap / sysfs ppi (Linux)
+# If there is no request there should not be a reboot_action pending.
+# If there is a request (1-22), it should clear and go back to 0 after a
+# restart, but may not be working properly.
+# We check PhysicalPresenceTransition (reboot_action): 1 or 2 means a reboot
+# is required to clear the Request state.
+# We check PhysicalPresenceConfirmationStatus (response): whether the operation
+# is allowed, blocked by BIOS, or requires a physically present user.
 
+# ---------------------------------------------------------------------------
+# Admin check
+# ---------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    echo "Need root (sudo) privileges to continue..." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Dependency check
+# ---------------------------------------------------------------------------
+for cmd in tpm2_getcap tpm2_ptool; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Required tool '$cmd' not found. Install tpm2-tools and try again." >&2
+        exit 1
+    fi
+done
+
+TPM_PPI="/sys/class/tpm/tpm0/ppi"
+
+if [[ ! -d "$TPM_PPI" ]]; then
+    echo "TPM PPI sysfs interface not found at $TPM_PPI." >&2
+    echo "Ensure your kernel supports TPM PPI (4.0+) and a TPM is present." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Read PPI values from sysfs
+#   request      => GetPhysicalPresenceRequest  (operation queued, 0-22)
+#   reboot_action=> GetPhysicalPresenceTransition (what the user must do)
+#   response     => GetPhysicalPresenceResponse / ConfirmationStatus
+# ---------------------------------------------------------------------------
+read_ppi() {
+    local file="$TPM_PPI/$1"
+    if [[ -r "$file" ]]; then
+        cat "$file" | tr -d '[:space:]'
+    else
+        echo "-1"
+    fi
+}
+
+REQUEST=$(read_ppi "request")
+TRANSITION=$(read_ppi "reboot_action")
+RESPONSE=$(read_ppi "response")
+
+# response file gives the last operation result; for ConfirmationStatus we
+# read the platform-specific transition/response codes. Map response to the
+# Windows ConfirmationStatus codes (0-4) as closely as possible.
+# 0 = not implemented / no response, 1 = BIOS only, 2 = blocked by BIOS,
+# 3 = allowed + PP required, 4 = allowed + PP not required.
+CONFIRMATION_STATUS="$RESPONSE"
+
+# ---------------------------------------------------------------------------
+# Decode functions
+# ---------------------------------------------------------------------------
+decode_request() {
+    local id="$1"
+    # Only meaningful when a reboot is pending (REQUEST > 0)
+    case "$id" in
+        0)  echo "No Request." ;;
+        1)  echo "Enable the TPM." ;;
+        2)  echo "Disable the TPM." ;;
+        3)  echo "Activate the TPM." ;;
+        4)  echo "Deactivate the TPM." ;;
+        5)  echo "Clear the TPM." ;;
+        6)  echo "Enable and activate the TPM." ;;
+        7)  echo "Deactivate and disable the TPM." ;;
+        8)  echo "Allow the installation of a TPM owner." ;;
+        9)  echo "Prevent the installation of a TPM owner." ;;
+        10) echo "Enable, activate, and allow the installation of a TPM owner." ;;
+        11) echo "Deactivate, disable, and prevent the installation of a TPM owner." ;;
+        12) echo "Deferred Physical Presence unowned field upgrade. Physical presence setting has been updated." ;;
+        # 13 is not implemented
+        14) echo "Clear, enable, and activate the TPM." ;;
+        15) echo "SetNoPPIProvision_False. Sets the provision that you must be physically present to set the TPM." ;;
+        16) echo "SetNoPPIProvision_True. Sets the provision that you don't need to be physically present to set the TPM." ;;
+        17) echo "SetNoPPIClear_False. Sets the provision that you must be physically present to clear the TPM." ;;
+        18) echo "SetNoPPIClear_True. Sets the provision that you don't need to be physically present to clear the TPM." ;;
+        19) echo "SetNoPPIMaintenance_False. Sets the provision that you must be physically present to maintain the TPM." ;;
+        20) echo "SetNoPPIMaintenance_True. Sets the provision that you don't need to be physically present to maintain the TPM." ;;
+        21) echo "Enable, activate, and clear the TPM." ;;
+        22) echo "Enable, activate, and clear the TPM, and then enable and reactivate the TPM." ;;
+        *)  echo "Not Implemented." ;;
+    esac
+}
+
+decode_transition() {
+    local id="$1"
+    case "$id" in
+        0) echo "No user action is needed to perform a TPM physical presence operation." ;;
+        1) echo "To perform a TPM physical presence operation, the user must shutdown the computer and then turn it back on using the power button. The user must be physically present at the computer to accept or reject the change when prompted by the BIOS." ;;
+        2) echo "To perform a TPM physical presence operation, the user must restart the computer using a warm reboot. The user must be physically present at the computer to accept or reject the change when prompted by the BIOS." ;;
+        3) echo "The required user action is unknown." ;;
+        *) echo "Not Implemented." ;;
+    esac
+}
+
+decode_confirmation() {
+    local id="$1"
+    case "$id" in
+        0) echo "Not Implemented." ;;
+        1) echo "BIOS Only." ;;
+        2) echo "Blocked for the OS by the BIOS cfg." ;;
+        3) echo "Allowed and Physically Present user required." ;;
+        4) echo "Allowed and Physically Present user not required." ;;
+        *) echo "Not Implemented." ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Resolve values
+# ---------------------------------------------------------------------------
+
+# Transition value
+TRANSITION_VAL=$(decode_transition "$TRANSITION")
+
+# Request value — only meaningful when a reboot is actually pending
+if [[ "$REQUEST" -gt 0 ]]; then
+    REQUEST_VAL=$(decode_request "$REQUEST")
+    RESTART_PENDING="True"
+else
+    REQUEST_VAL="No restart pending."
+    RESTART_PENDING="False"
+fi
+
+CONFIRMATION_VAL=$(decode_confirmation "$CONFIRMATION_STATUS")
+
+# ---------------------------------------------------------------------------
+# Print formatted table (mimics PowerShell Format-Table)
+# ---------------------------------------------------------------------------
+COL1_W=42   # Instance column width
+COL2_W=4    # ID column width
+# Value column wraps at terminal width or 80 chars, whichever is smaller
+TERM_W=$(tput cols 2>/dev/null || echo 80)
+COL3_W=$(( TERM_W - COL1_W - COL2_W - 6 ))   # account for separators/padding
+[[ $COL3_W -lt 20 ]] && COL3_W=40
+
+# Word-wrap a string to a given width, indenting continuation lines
+wrap_text() {
+    local text="$1"
+    local width="$2"
+    local indent="$3"   # spaces for continuation lines
+    echo "$text" | fold -s -w "$width" | awk -v ind="$indent" 'NR==1{print} NR>1{print ind $0}'
+}
+
+HR=$(printf '%*s' $(( COL1_W + COL2_W + COL3_W + 6 )) '' | tr ' ' '-')
+
+printf "\n"
+printf "%-${COL1_W}s  %-${COL2_W}s  %s\n" "Instance" "ID" "Value"
+echo "$HR"
+
+# Row 1 — GetPhysicalPresenceRequest
+WRAPPED=$(wrap_text "$REQUEST_VAL" "$COL3_W" "$(printf '%*s' $(( COL1_W + COL2_W + 4 )) '')")
+printf "%-${COL1_W}s  %-${COL2_W}s  %s\n" "GetPhysicalPresenceRequest" "$REQUEST" "$WRAPPED"
+echo "$HR"
+
+# Row 2 — GetPhysicalPresenceTransition
+WRAPPED=$(wrap_text "$TRANSITION_VAL" "$COL3_W" "$(printf '%*s' $(( COL1_W + COL2_W + 4 )) '')")
+printf "%-${COL1_W}s  %-${COL2_W}s  %s\n" "GetPhysicalPresenceTransition" "$TRANSITION" "$WRAPPED"
+echo "$HR"
+
+# Row 3 — GetPhysicalPresenceConfirmationStatus
+WRAPPED=$(wrap_text "$CONFIRMATION_VAL" "$COL3_W" "$(printf '%*s' $(( COL1_W + COL2_W + 4 )) '')")
+printf "%-${COL1_W}s  %-${COL2_W}s  %s\n" "GetPhysicalPresenceConfirmationStatus" "$CONFIRMATION_STATUS" "$WRAPPED"
+echo "$HR"
+
+printf "\nRestart Pending: %s\n\n" "$RESTART_PENDING"
