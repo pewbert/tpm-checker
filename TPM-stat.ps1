@@ -27,18 +27,27 @@ $table.Columns.Add($column3)
 $row1 = $table.NewRow()
 $row2 = $table.NewRow()
 $row3 = $table.NewRow()
+$row4 = $table.NewRow()
+$row5 = $table.NewRow()
 
 $tpm = Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftTpm' -ClassName 'Win32_TPM'
 $tval = $tpm | Invoke-CimMethod -MethodName 'GetPhysicalPresenceTransition'
 $rval = $tpm | Invoke-CimMethod -MethodName 'GetPhysicalPresenceRequest'
-$x    = $tpm | Invoke-CimMethod -MethodName 'GetPhysicalPresenceConfirmationStatus' -Arguments @{Operation=$rval.Request}
+$cval= $tpm | Invoke-CimMethod -MethodName 'GetPhysicalPresenceConfirmationStatus' -Arguments @{Operation=$rval.Request}
+$BIOS = Get-CimInstance -ClassName 'Win32_BIOS'
 
 $row1.ID = $rval.Request
 $row1.Instance = "GetPhysicalPresenceRequest"
 $row2.ID = $tval.Transition
 $row2.Instance = "GetPhysicalPresenceTransition"
-$row3.ID = $x.ConfirmationStatus
+$row3.ID = $cval.ConfirmationStatus
 $row3.Instance = "GetPhysicalPresenceConfirmationStatus"
+$row4.Instance = "Confirm-SecureBootUEFI"
+$row4.Value = Confirm-SecureBootUEFI
+$row5.Instance = $BIOS.Manufacturer
+$row5.ID = $BIOS.Name
+$row5.Value = $BIOS.Version
+#
 
     switch ($tval.Transition)
     {
@@ -49,7 +58,8 @@ $row3.Instance = "GetPhysicalPresenceConfirmationStatus"
         default {$row2.Value = "Not Implemented."  }
     }
 
-$rp = Get-TPM | Select-Object RestartPending
+$TPM = Get-tpm
+$rp = $TPM | Select-Object RestartPending
 if (($rp.RestartPending) -eq $True) 
  {
     switch ($rval.Request) 
@@ -59,7 +69,7 @@ if (($rp.RestartPending) -eq $True)
             2  { $row1.Value = "Disable the TPM." }
             3  { $row1.Value = "Activate the TPM." }
             4  { $row1.Value = "Deactivate the TPM." }
-            5  { $row1.Value = "Clear the TPM."  }
+            5  { $row1.Value = "Clear the TPM." }
             6  { $row1.Value = "Enable and activate the TPM." }
             7  { $row1.Value = "Deactivate and disable the TPM." }
             8  { $row1.Value = "Allow the installation of a TPM owner." }
@@ -79,21 +89,23 @@ if (($rp.RestartPending) -eq $True)
             22 { $row1.Value = "Enable, activate, and clear the TPM, and then enable and reactivate the TPM." }
             default { $row1.Value = "Not Implemented." }
      }
-     
 }
 else { $row1.Value = "No restart pending." }
-    switch ($x.ConfirmationStatus) 
+    switch ($cval.ConfirmationStatus) 
     {
         0 { $row3.Value = "Not Implemented." }
         1 { $row3.Value = "BIOS Only." }
         2 { $row3.Value = "Blocked for the OS by the BIOS cfg." }
-        3 { $row3.Value = "Allowed and Physically Present user required."}
-        4 { $row3.Value = "Allowed and Physically Present user not required."}
+        3 { $row3.Value = "Allowed and Physically Present user required." }
+        4 { $row3.Value = "Allowed and Physically Present user not required." }
     }
 
 $table.Rows.Add($row1)
 $table.Rows.Add($row2)
 $table.Rows.Add($row3)
+$table.Rows.Add($row4)
+$table.Rows.Add($row5)
 
-$table | Format-Table
+$table | Format-Table -autosize -wrap
+
 }
